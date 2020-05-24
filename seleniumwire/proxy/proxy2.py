@@ -297,13 +297,17 @@ class ProxyAwareHTTPConnection(HTTPConnection):
             super().__init__(netloc, *args, **kwargs)
 
     def connect(self):
-        if self.use_proxy and self.proxy_config['http'].scheme.startswith('socks'):
+        proxy_config = self.proxy_config.get('http')
+        proxy_scheme = proxy_config.scheme if proxy_config else ''
+        if self.use_proxy and proxy_scheme.startswith('socks'):
             self.sock = _socks_connection(
                 self.host,
                 self.port,
                 self.timeout,
                 self.proxy_config['http']
             )
+        elif self.use_proxy and proxy_scheme == 'https':
+            self.sock = _https_connection(self.proxy_config['http'])
         else:
             super().connect()
 
@@ -375,6 +379,8 @@ def _create_auth_header(proxy_username, proxy_password, custom_proxy_authorizati
     headers = {}
 
     if proxy_username and proxy_password and not custom_proxy_authorization:
+        proxy_username = urllib.parse.unquote(proxy_username)
+        proxy_password = urllib.parse.unquote(proxy_password)
         auth = '{}:{}'.format(proxy_username, proxy_password)
         headers['Proxy-Authorization'] = 'Basic {}'.format(base64.b64encode(auth.encode('utf-8')).decode('utf-8'))
     elif custom_proxy_authorization:
@@ -408,3 +414,30 @@ def _socks_connection(host, port, timeout, socks_config):
         socks_config.password,
         ((socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),)
     )
+
+
+def _https_connection(proxy):
+    protocol, username, password, hostname, port = parse_proxy(proxy)
+    connection = HTTPSConnection(hostname, port)
+    connection.connect()
+    return connection.sock
+
+
+def parse_proxy(proxy_config):
+    '''Split proxy_config to include correct port
+    Expects output from urllib.request._parse_proxy`
+    '''
+    protocol, username, password, host = proxy_config
+    host = host.split(':', 1)
+    hostname = host[0]
+
+    if host[1:]:
+        port = int(host[1])
+    elif protocol == 'http':
+        port = 80
+    elif protocol == 'https':
+        port = 443
+    else:
+        port = None
+
+    return protocol, username, password, hostname, port
