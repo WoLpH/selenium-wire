@@ -77,51 +77,52 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
     # Subclasses can override certdir
     certdir = cert.CERTDIR
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, request, client_address, server):
         self.tls = threading.local()
         self.tls.conns = {}
         self.websocket = False
 
-        super().__init__(*args, **kwargs)
+        super().__init__(request, client_address, server)
 
     def do_CONNECT(self):
         print('do_CONNECT', self.path)
-        try:
-            self.send_response(200, 'Connection Established')
-            self.end_headers()
+        self.send_response(200, 'Connection Established')
+        self.end_headers()
 
-            certpath = cert.generate(self.path.split(':')[0], self.certdir)
+        hostname = self.path.split(':')[0]
+        certfile = cert.generate(hostname, self.certdir)
+        keyfile = cert.CERTKEY
 
-            with ssl.wrap_socket(self.connection, keyfile=cert.CERTKEY, certfile=certpath, server_side=True) as conn:
-                self.connection = conn
-                self.rfile = conn.makefile('rb', self.rbufsize)
-                self.wfile = conn.makefile('wb', self.wbufsize)
+        # check_hostname = False
+        # context = ssl._create_default_https_context()
+        # context.check_hostname = check_hostname
+        # context.verify_mode = ssl.CERT_REQUIRED
+        # if keyfile or certfile:
+        #     context.load_cert_chain(certfile, keyfile)
+        #
+        # context.load_verify_locations(cert.CACERT)
+        #
+        # # with ssl.wrap_socket(self.connection, keyfile=cert.CERTKEY, certfile=certpath, server_side=True) as conn:
+        # print('connection', self.connection)
+        # conn = context.wrap_socket(self.connection, server_side=True)
+        with ssl.wrap_socket(self.connection, keyfile=cert.CERTKEY,
+                             certfile=certfile, server_side=True) as conn:
+            self.connection = conn
+            self.rfile = conn.makefile('rb', self.rbufsize)
+            self.wfile = conn.makefile('wb', self.wbufsize)
 
-            # hostname = self.path.split(':')[0]
-            # context = ssl.create_default_context()
-            # print(self.connection)
-            # self.connection = context.wrap_socket(self.connection,
-            #                                       server_hostname=hostname)
-            # with ssl.wrap_socket(self.connection, keyfile=cert.CERTKEY, certfile=certpath, server_side=True) as conn:
-            #     self.connection = conn
-            #     self.rfile = conn.makefile('rb', self.rbufsize)
-            #     self.wfile = conn.makefile('wb', self.wbufsize)
-
-            # conn = self.connection
-            # self.rfile = conn.makefile('rb', self.rbufsize)
-            # self.wfile = conn.makefile('wb', self.wbufsize)
-
-            conntype = self.headers.get('Proxy-Connection', '')
-            if self.protocol_version == 'HTTP/1.1' and conntype.lower() != 'close':
-                self.close_connection = False
-            else:
-                self.close_connection = True
-        except Exception as e:
-            print('got connect exception', e)
-            raise
+        print('wrapped', self.connection)
+        conntype = self.headers.get('Proxy-Connection', '')
+        if self.protocol_version == 'HTTP/1.1' and conntype.lower() != 'close':
+            self.close_connection = False
+        else:
+            self.close_connection = True
 
     def do_GET(self):
+        # import traceback
+        # traceback.print_stack()
         print('do_GET', self.path)
+
         if self.path.startswith(self.admin_path):
             self.admin_handler()
             return
@@ -167,8 +168,9 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             setattr(res, 'response_version', version_table[res.version])
 
             res_body = res.read()
-        except Exception as e:
-            print('got GET exception', e)
+        except Exception:
+            import traceback
+            traceback.print_exc()
             if origin in self.tls.conns:
                 del self.tls.conns[origin]
             self.send_error(502)
@@ -209,18 +211,26 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
 
         if origin not in self.tls.conns:
             proxy_config = self.server.proxy_config
+            if proxy_config and proxy_config.get(scheme):
+                proxy_scheme = proxy_config[scheme].scheme
+            else:
+                proxy_scheme = ''
 
             kwargs = {
                 'timeout': self.timeout
             }
 
-            if scheme == 'https' and False:
+            if scheme == 'https' and proxy_scheme != 'https':
+            # if scheme == 'https':
                 connection = ProxyAwareHTTPSConnection
                 if not self.server.options.get('verify_ssl', True):
                     kwargs['context'] = ssl._create_unverified_context()
+                # self.tls.conns[origin] = connection
             else:
+                # kwargs['context'] = ssl._create_unverified_context()
                 connection = ProxyAwareHTTPConnection
 
+            print(connection, proxy_config, netloc, kwargs)
             self.tls.conns[origin] = connection(proxy_config, netloc, **kwargs)
 
         return self.tls.conns[origin]
@@ -344,7 +354,6 @@ class ProxyAwareHTTPConnection(HTTPConnection):
     """
 
     def __init__(self, proxy_config, netloc, *args, **kwargs):
-        raise RuntimeError()
         self.proxy_config = proxy_config
         self.netloc = netloc
         self.use_proxy = 'http' in proxy_config and netloc not in proxy_config.get('no_proxy', '')
@@ -355,79 +364,11 @@ class ProxyAwareHTTPConnection(HTTPConnection):
         else:
             super().__init__(netloc, *args, **kwargs)
 
-    def connect(self):
-        print('connect', self.host)
-        proxy_config = self.proxy_config.get('http')
-        proxy_scheme = proxy_config.scheme if proxy_config else ''
-        if self.use_proxy and proxy_scheme.startswith('socks'):
-            self.sock = _socks_connection(
-                self.host,
-                self.port,
-                self.timeout,
-                self.proxy_config['http']
-            )
-        elif self.use_proxy and proxy_scheme == 'https':
-            connection = HTTPSConnection(self.host)
-            self.sock = connection.sock
-            # if self._tunnel_host:
-            #     self._tunnel()
-
-            # certpath = cert.generate(self.host, cert.CERTDIR)
-            #
-            # self.sock = ssl.wrap_socket(self.sock, keyfile=cert.CERTKEY,
-            #                      certfile=certpath, server_side=True)
-
-        else:
-            super().connect()
-
-    def request(self, method, url, body=None, headers=None, *, encode_chunked=False):
-        print('request', method, url)
-        if headers is None:
-            headers = {}
-
-        if self.use_proxy and self.proxy_config['http'].scheme.startswith('http'):
-            if not url.startswith('http'):
-                url = 'http://{}{}'.format(self.netloc, url)
-
-            headers.update(_create_auth_header(
-                self.proxy_config['http'].username,
-                self.proxy_config['http'].password,
-                self.custom_authorization)
-            )
-
-        super().request(method, url, body, headers=headers)
-
-
-class ProxyAwareHTTPSConnection(HTTPSConnection):
-    """A specialised HTTPSConnection that will transparently connect to a
-    HTTP or SOCKS proxy server based on supplied proxy configuration.
-    """
-
-    def __init__(self, proxy_config, netloc, *args, **kwargs):
-        self.proxy_config = proxy_config
-        self.use_proxy = 'https' in proxy_config and netloc not in proxy_config.get('no_proxy', '')
-
-        if self.use_proxy and proxy_config['https'].scheme.startswith('http'):
-            # For HTTP proxies, CONNECT tunnelling is used
-            super().__init__(proxy_config['https'].hostport, *args, **kwargs)
-            netloc_host, netloc_port = get_hostname_port(netloc, 'https')
-            self.set_tunnel(
-                netloc_host,
-                netloc_port,
-                headers=_create_auth_header(
-                    proxy_config['https'].username,
-                    proxy_config['https'].password,
-                    proxy_config.get('custom_authorization')
-                )
-            )
-        else:
-            super().__init__(netloc, *args, **kwargs)
-
     def _setup_https_tunnel(self):
         sock = self.sock
+
         host = self._tunnel_host
         port = self._tunnel_port
-        print('sock', sock, host, port)
 
         try:
             lines = []
@@ -490,7 +431,7 @@ class ProxyAwareHTTPSConnection(HTTPSConnection):
         self.sock = tls_conn
 
     def connect(self):
-        print('connect', self.host, self.port)
+        print('connect')
         proxy_config = self.proxy_config.get('https')
         proxy_scheme = proxy_config.scheme if proxy_config else ''
         if self.use_proxy and proxy_scheme.startswith('socks'):
@@ -498,60 +439,122 @@ class ProxyAwareHTTPSConnection(HTTPSConnection):
                 self.host,
                 self.port,
                 self.timeout,
-                self.proxy_config['http']
+                proxy_config
             )
         elif self.use_proxy and proxy_scheme == 'https':
-            connection = HTTPSConnection(self.host, self.port)
-            connection.set_tunnel(self._tunnel_host, self._tunnel_port,
-                                  self._tunnel_headers)
+            # connection = HTTPSConnection(self.host, check_hostname=True)
+            # connection.connect()
+            # self.sock = connection.sock
+            #
+            # return self.sock
+
+            sock = self._create_connection(
+                (self.host, 443), self.timeout, self.source_address)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+            context = ssl.create_default_context()
+
+            self.sock = context.wrap_socket(sock, server_hostname=self.host)
+
+            self._setup_https_tunnel()
+            print('created tunnel')
+
+            return
+            # context = ssl._create_unverified_context(check_hostname=False)
+            # print('host', self.host)
+            # self.sock = _https_connection(proxy_config)
+            # self.sock = _https_connection(self.proxy_config['http'], context)
+
+            protocol, username, password, hostname, port = parse_proxy(proxy_config)
+
+            context = ssl.create_default_context(purpose=ssl.Purpose.CLIENT_AUTH)
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context = ssl._create_unverified_context(check_hostname=False)
+
+            # certpath = cert.generate(hostname, cert.CERTDIR)
+            #     with ssl.wrap_socket(connection.sock,
+            #                          keyfile=cert.CERTKEY,
+            #                          certfile=certpath, server_side=True) as sock:
+
+            print(hostname, port, self.netloc)
+            connection = HTTPSConnection(hostname, port, context=context)
             connection.connect()
             self.sock = connection.sock
-            # sock = self._create_connection(
-            #     (self.host, self.port), self.timeout, self.source_address)
-            # sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            # self._origin_sock = sock
-            #
-            # self.ssl_context = ssl.create_default_context()
-            #
-            # self.sock = self.ssl_context.wrap_socket(sock,
-            #                                      server_hostname=self.host)
+            # certpath = cert.generate(hostname, cert.CERTDIR)
             # try:
-            #     self._setup_https_tunnel()
+            #     with ssl.wrap_socket(connection.sock,
+            #                          keyfile=cert.CERTKEY,
+            #                          certfile=certpath, server_side=True) as sock:
+            #         self.sock = sock
             # except Exception as e:
-            #     print('unable to setup tunnel', e)
+            #     print('got excpeiton', e)
             #     raise
-            #
-            # self.is_verified = (
-            #     self.ssl_context.verify_mode == ssl.CERT_REQUIRED or
-            #     self.assert_fingerprint is not None
-            # )
-
-            # connection = HTTPSConnection(self.host)
-            # self.sock = connection.sock
-            # if self._tunnel_host:
-            #     self._tunnel()
-
-            # certpath = cert.generate(self.host, cert.CERTDIR)
-            #
-            # self.sock = ssl.wrap_socket(self.sock, keyfile=cert.CERTKEY,
-            #                      certfile=certpath, server_side=True)
-
+            if self._tunnel_host:
+                self._tunnel()
         else:
             super().connect()
 
-    # def connect(self):
-    #     proxy_config = self.proxy_config.get('https')
-    #     proxy_scheme = proxy_config.scheme if proxy_config else ''
-    #     if self.use_proxy and proxy_scheme.startswith('socks'):
-    #         self.sock = _socks_connection(
-    #             self.host,
-    #             self.port,
-    #             self.timeout,
-    #             self.proxy_config['https']
-    #         )
-    #         self.sock = self._context.wrap_socket(self.sock, server_hostname=self.host)
-    #     else:
-    #         super().connect()
+    def request(self, method, url, body=None, headers=None, *, encode_chunked=False):
+        if headers is None:
+            headers = {}
+
+        if self.use_proxy and self.proxy_config['http'].scheme.startswith('http'):
+            if not url.startswith('http'):
+                url = 'http://{}{}'.format(self.netloc, url)
+
+            headers.update(_create_auth_header(
+                self.proxy_config['http'].username,
+                self.proxy_config['http'].password,
+                self.custom_authorization)
+            )
+
+        super().request(method, url, body, headers=headers)
+
+
+class ProxyAwareHTTPSConnection(HTTPSConnection):
+    """A specialised HTTPSConnection that will transparently connect to a
+    HTTP or SOCKS proxy server based on supplied proxy configuration.
+    """
+
+    def __init__(self, proxy_config, netloc, *args, **kwargs):
+        self.proxy_config = proxy_config
+        self.use_proxy = 'https' in proxy_config and netloc not in proxy_config.get('no_proxy', '')
+
+        if self.use_proxy and proxy_config['https'].scheme.startswith('http'):
+            # For HTTP proxies, CONNECT tunnelling is used
+            super().__init__(proxy_config['https'].hostport, *args, **kwargs)
+            netloc_host, netloc_port = get_hostname_port(netloc, 'https')
+            self.set_tunnel(
+                netloc_host,
+                netloc_port,
+                headers=_create_auth_header(
+                    proxy_config['https'].username,
+                    proxy_config['https'].password,
+                    proxy_config.get('custom_authorization')
+                )
+            )
+        else:
+            super().__init__(netloc, *args, **kwargs)
+
+    def connect(self):
+        proxy_config = self.proxy_config.get('https')
+        proxy_scheme = proxy_config.scheme if proxy_config else ''
+        if self.use_proxy and proxy_scheme.startswith('socks'):
+            self.sock = _socks_connection(
+                self.host,
+                self.port,
+                self.timeout,
+                self.proxy_config['https']
+            )
+            self.sock = self._context.wrap_socket(self.sock, server_hostname=self.host)
+        # elif self.use_proxy and proxy_scheme == 'https':
+            # self.sock = _https_connection(self.proxy_config['https'])
+            # self.sock = self._context.wrap_socket(
+            #     self.sock, server_hostname=self.host)
+            # if self._tunnel_host:
+            #     self._tunnel()
+        else:
+            super().connect()
 
 
 def _create_auth_header(proxy_username, proxy_password, custom_proxy_authorization):
@@ -606,9 +609,13 @@ def _socks_connection(host, port, timeout, socks_config):
     )
 
 
-def _https_connection(proxy):
+def _https_connection(proxy, context=None):
     protocol, username, password, hostname, port = parse_proxy(proxy)
-    connection = HTTPSConnection(hostname, port)
+
+    if not context:
+        context = ssl._create_unverified_context()
+
+    connection = HTTPSConnection(hostname, port, context=context)
     connection.connect()
     return connection.sock
 
